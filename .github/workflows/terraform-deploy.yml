@@ -1,0 +1,281 @@
+# validação deploy da aplicação homolog, infraestrutura, add-ons e observabilidade
+name: Terraform deploy
+
+on:
+  push:
+    branches: [main, homolog]
+    paths:
+      - '.github/workflows/terraform-deploy.yml'
+      - '.mvn/**'
+      - 'environments/**'
+      - 'scripts/**'
+      - 'src/**'
+      - '*.tf'
+      - '.terraform.lock.hcl'
+      - 'mvnw'
+      - 'pom.xml'
+  workflow_dispatch:
+
+concurrency:
+  group: terraform-deploy-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  validate-homolog:
+    name: Validate configuration and AWS
+    if: github.ref_name == 'homolog'
+    runs-on: ubuntu-latest
+    environment: homolog
+    permissions:
+      contents: read
+    env:
+      TARGET_ENVIRONMENT: homolog
+      TF_CLOUD_ORGANIZATION: ${{ vars.TF_CLOUD_ORGANIZATION }}
+      TF_WORKSPACE: ${{ vars.TF_WORKSPACE_HOMOLOG }}
+      TF_APPLY_ENABLED: ${{ vars.TF_APPLY_ENABLED }}
+      AWS_REGION: ${{ vars.AWS_REGION || 'us-west-2' }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate branch and deployment configuration
+        env:
+          TF_API_TOKEN: ${{ secrets.TF_API_TOKEN }}
+          GITHUB_SYNC_TOKEN: ${{ secrets.GITHUB_SYNC_TOKEN }}
+          SYNC_APP_CLIENT_ID: ${{ vars.SYNC_APP_CLIENT_ID }}
+          SYNC_APP_PRIVATE_KEY: ${{ secrets.SYNC_APP_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          if [ "$TF_APPLY_ENABLED" != "true" ]; then
+            echo "::error::TF_APPLY_ENABLED deve valer true no ambiente ${TARGET_ENVIRONMENT}."
+            exit 1
+          fi
+          missing=()
+          for name in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN TF_CLOUD_ORGANIZATION TF_WORKSPACE TF_API_TOKEN; do
+            if [ -z "${!name:-}" ]; then missing+=("$name"); fi
+          done
+          if [ -z "$GITHUB_SYNC_TOKEN" ] && { [ -z "$SYNC_APP_CLIENT_ID" ] || [ -z "$SYNC_APP_PRIVATE_KEY" ]; }; then
+            missing+=("GITHUB_SYNC_TOKEN ou SYNC_APP_CLIENT_ID+SYNC_APP_PRIVATE_KEY")
+          fi
+          if [ "${#missing[@]}" -gt 0 ]; then
+            printf '::error::Configuração de deploy incompleta: %s\n' "${missing[*]}"
+            exit 1
+          fi
+
+      - name: Validate AWS Academy session
+        run: ./scripts/validate-aws-session.sh
+
+  package-homolog:
+    name: Package Lambda artifact
+    needs: validate-homolog
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - name: Package and validate Lambda artifact
+        run: |
+          chmod +x mvnw
+          ./mvnw -B verify spotless:check
+
+      - name: Upload Lambda artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: oficina-auth-${{ github.sha }}
+          path: target/oficina-auth.jar
+          if-no-files-found: error
+          retention-days: 1
+
+  terraform-homolog:
+    name: Terraform Auth
+    needs: package-homolog
+    runs-on: ubuntu-latest
+    environment: homolog
+    permissions:
+      contents: read
+    env:
+      TARGET_ENVIRONMENT: homolog
+      TF_CLOUD_ORGANIZATION: ${{ vars.TF_CLOUD_ORGANIZATION }}
+      TF_WORKSPACE: ${{ vars.TF_WORKSPACE_HOMOLOG }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download Lambda artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: oficina-auth-${{ github.sha }}
+          path: target
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
+
+      - name: Terraform init
+        run: terraform init -input=false -lockfile=readonly
+
+      - name: Terraform plan
+        run: terraform plan -input=false -no-color
+
+      - name: Terraform apply
+        run: terraform apply -input=false -no-color -auto-approve
+
+      - name: Generate GitHub App synchronization token
+        id: sync-app-token
+        if: ${{ vars.SYNC_APP_CLIENT_ID != '' }}
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        with:
+          client-id: ${{ vars.SYNC_APP_CLIENT_ID }}
+          private-key: ${{ secrets.SYNC_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: oficina-os-service
+
+      - name: Sincronizar API Gateway com o Backend
+        env:
+          GITHUB_SYNC_TOKEN: ${{ steps.sync-app-token.outputs.token || secrets.GITHUB_SYNC_TOKEN }}
+        run: |
+          set -euo pipefail
+          terraform output -json > "$RUNNER_TEMP/auth-outputs.json"
+          python3 scripts/sync-auth-outputs.py \
+            --outputs-file "$RUNNER_TEMP/auth-outputs.json" \
+            --environment "$TARGET_ENVIRONMENT"
+          echo "- API Gateway sincronizado com o Backend" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Terraform outputs
+        run: terraform output -no-color
+
+  summary-homolog:
+    name: Deployment summary
+    needs: terraform-homolog
+    runs-on: ubuntu-latest
+    environment: homolog
+    permissions:
+      contents: read
+    env:
+      TF_WORKSPACE: ${{ vars.TF_WORKSPACE_HOMOLOG }}
+    steps:
+      - name: Summary
+        run: |
+          {
+            echo "## Auth aplicado em homolog"
+            echo
+            echo "- workspace: \`${TF_WORKSPACE}\`"
+            echo "- branch: \`${GITHUB_REF_NAME}\`"
+            echo "- commit: \`${GITHUB_SHA}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  deploy-production:
+    name: Apply (production)
+    if: github.ref_name == 'main'
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+    env:
+      TARGET_ENVIRONMENT: production
+      TF_CLOUD_ORGANIZATION: ${{ vars.TF_CLOUD_ORGANIZATION }}
+      TF_WORKSPACE: ${{ vars.TF_WORKSPACE_PRODUCTION }}
+      TF_APPLY_ENABLED: ${{ vars.TF_APPLY_ENABLED }}
+      AWS_REGION: ${{ vars.AWS_REGION || 'us-west-2' }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate branch and deployment configuration
+        env:
+          TF_API_TOKEN: ${{ secrets.TF_API_TOKEN }}
+          GITHUB_SYNC_TOKEN: ${{ secrets.GITHUB_SYNC_TOKEN }}
+          SYNC_APP_CLIENT_ID: ${{ vars.SYNC_APP_CLIENT_ID }}
+          SYNC_APP_PRIVATE_KEY: ${{ secrets.SYNC_APP_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          if [ "$TF_APPLY_ENABLED" != "true" ]; then
+            echo "::error::TF_APPLY_ENABLED deve valer true no ambiente ${TARGET_ENVIRONMENT}."
+            exit 1
+          fi
+          missing=()
+          for name in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN TF_CLOUD_ORGANIZATION TF_WORKSPACE TF_API_TOKEN; do
+            if [ -z "${!name:-}" ]; then missing+=("$name"); fi
+          done
+          if [ -z "$GITHUB_SYNC_TOKEN" ] && { [ -z "$SYNC_APP_CLIENT_ID" ] || [ -z "$SYNC_APP_PRIVATE_KEY" ]; }; then
+            missing+=("GITHUB_SYNC_TOKEN ou SYNC_APP_CLIENT_ID+SYNC_APP_PRIVATE_KEY")
+          fi
+          if [ "${#missing[@]}" -gt 0 ]; then
+            printf '::error::Configuração de deploy incompleta: %s\n' "${missing[*]}"
+            exit 1
+          fi
+
+      - name: Setup Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - name: Package and validate Lambda artifact
+        run: |
+          chmod +x mvnw
+          ./mvnw -B verify spotless:check
+
+      - name: Validate AWS Academy session
+        run: ./scripts/validate-aws-session.sh
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
+
+      - name: Terraform init
+        run: terraform init -input=false -lockfile=readonly
+
+      - name: Terraform plan
+        run: terraform plan -input=false -no-color
+
+      - name: Terraform apply
+        run: terraform apply -input=false -no-color -auto-approve
+
+      - name: Generate GitHub App synchronization token
+        id: sync-app-token
+        if: ${{ vars.SYNC_APP_CLIENT_ID != '' }}
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        with:
+          client-id: ${{ vars.SYNC_APP_CLIENT_ID }}
+          private-key: ${{ secrets.SYNC_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: oficina-os-service
+
+      - name: Sincronizar API Gateway com o Backend
+        env:
+          GITHUB_SYNC_TOKEN: ${{ steps.sync-app-token.outputs.token || secrets.GITHUB_SYNC_TOKEN }}
+        run: |
+          set -euo pipefail
+          terraform output -json > "$RUNNER_TEMP/auth-outputs.json"
+          python3 scripts/sync-auth-outputs.py \
+            --outputs-file "$RUNNER_TEMP/auth-outputs.json" \
+            --environment "$TARGET_ENVIRONMENT"
+          echo "- API Gateway sincronizado com o Backend" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Terraform outputs
+        run: terraform output -no-color
+
+      - name: Summary
+        run: |
+          {
+            echo "## Auth aplicado em ${TARGET_ENVIRONMENT}"
+            echo
+            echo "- workspace: \`${TF_WORKSPACE}\`"
+            echo "- branch: \`${GITHUB_REF_NAME}\`"
+            echo "- commit: \`${GITHUB_SHA}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
