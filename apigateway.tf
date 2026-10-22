@@ -1,19 +1,34 @@
 locals {
+  # Rotas do cliente (token do login por CPF) repassadas aos serviços no EKS.
   backend_route_keys = var.backend_base_url == null ? [] : [
     "GET /consulta/ordens-servico/{numeroOs}/status",
-    "GET /ordens-servico/{numeroOs}/historico",
-    "POST /ordens-servico/{numeroOs}/aprovar",
-    "POST /ordens-servico/{numeroOs}/rejeitar-refazer",
-    "POST /ordens-servico/{numeroOs}/rejeitar-cancelar",
-    "POST /ordens-servico/{numeroOs}/confirmar-pagamento"
+    "GET /ordens-servico/{numeroOs}/historico"
   ]
 
-  backend_routes = {
-    for route_key in local.backend_route_keys : route_key => {
-      method = split(" ", route_key)[0]
-      path   = split(" ", route_key)[1]
+  orcamento_pagamento_route_keys = var.orcamento_pagamento_base_url == null ? [] : [
+    "GET /orcamentos/{numeroOs}",
+    "POST /orcamentos/{numeroOs}/aprovar",
+    "POST /orcamentos/{numeroOs}/rejeitar",
+    "GET /pagamentos/{numeroOs}",
+    "POST /pagamentos/{numeroOs}/nova-tentativa"
+  ]
+
+  backend_routes = merge(
+    {
+      for route_key in local.backend_route_keys : route_key => {
+        method   = split(" ", route_key)[0]
+        path     = split(" ", route_key)[1]
+        base_url = var.backend_base_url
+      }
+    },
+    {
+      for route_key in local.orcamento_pagamento_route_keys : route_key => {
+        method   = split(" ", route_key)[0]
+        path     = split(" ", route_key)[1]
+        base_url = var.orcamento_pagamento_base_url
+      }
     }
-  }
+  )
 }
 
 resource "aws_apigatewayv2_api" "main" {
@@ -75,7 +90,7 @@ resource "aws_apigatewayv2_integration" "backend" {
   api_id             = aws_apigatewayv2_api.main.id
   integration_type   = "HTTP_PROXY"
   integration_method = each.value.method
-  integration_uri    = "${var.backend_base_url}${each.value.path}"
+  integration_uri    = "${each.value.base_url}${each.value.path}"
 
   # Garante o identificador de correlação no backend mesmo sem X-Request-Id do cliente.
   request_parameters = {
@@ -91,6 +106,24 @@ resource "aws_apigatewayv2_route" "backend" {
   authorization_type = "CUSTOM"
   authorizer_id      = aws_apigatewayv2_authorizer.jwt.id
   target             = "integrations/${aws_apigatewayv2_integration.backend[each.key].id}"
+}
+
+# Webhook do Mercado Pago: sem authorizer; o serviço valida a assinatura x-signature.
+resource "aws_apigatewayv2_integration" "mercadopago_webhook" {
+  count = var.orcamento_pagamento_base_url == null ? 0 : 1
+
+  api_id             = aws_apigatewayv2_api.main.id
+  integration_type   = "HTTP_PROXY"
+  integration_method = "POST"
+  integration_uri    = "${var.orcamento_pagamento_base_url}/webhooks/mercadopago"
+}
+
+resource "aws_apigatewayv2_route" "mercadopago_webhook" {
+  count = var.orcamento_pagamento_base_url == null ? 0 : 1
+
+  api_id    = aws_apigatewayv2_api.main.id
+  route_key = "POST /webhooks/mercadopago"
+  target    = "integrations/${aws_apigatewayv2_integration.mercadopago_webhook[0].id}"
 }
 
 resource "aws_cloudwatch_log_group" "api" {

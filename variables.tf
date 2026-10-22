@@ -208,6 +208,18 @@ variable "backend_base_url" {
   }
 }
 
+variable "orcamento_pagamento_base_url" {
+  description = "URL pública do LoadBalancer do Orçamento e Pagamento, sem barra final. Nulo não cria as rotas de orçamento, pagamento e webhook."
+  type        = string
+  default     = null
+  nullable    = true
+
+  validation {
+    condition     = var.orcamento_pagamento_base_url == null || can(regex("^https?://[^/]+$", var.orcamento_pagamento_base_url))
+    error_message = "orcamento_pagamento_base_url deve ser uma URL HTTP(S) sem barra final."
+  }
+}
+
 variable "notification_api_key" {
   description = "Chave compartilhada pelo backend e pela Lambda de ingresso de notificações."
   type        = string
