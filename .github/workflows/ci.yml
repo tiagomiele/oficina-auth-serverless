@@ -1,0 +1,110 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main, homolog]
+  push:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  repository-validation:
+    name: Repository validation
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate GitHub Actions workflows
+        run: |
+          curl --retry 3 --retry-all-errors -fsSL \
+            https://github.com/rhysd/actionlint/releases/download/v1.7.7/actionlint_1.7.7_linux_amd64.tar.gz \
+            -o /tmp/actionlint.tar.gz
+          tar -xzf /tmp/actionlint.tar.gz -C /tmp actionlint
+          /tmp/actionlint
+
+      - name: Test Auth output synchronization
+        run: python3 -m unittest tests/test_sync_auth_outputs.py
+
+  application-validation:
+    name: Java build and tests
+    needs: repository-validation
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - name: Grant execute permission for Maven Wrapper
+        run: chmod +x mvnw
+
+      - name: Build focused serverless artifact
+        run: ./mvnw -B verify spotless:check
+
+  terraform-validation:
+    name: Terraform validation
+    needs: application-validation
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform format
+        run: terraform fmt -check -recursive
+
+      - name: Terraform init without remote execution
+        run: terraform init -backend=false -input=false -lockfile=readonly
+
+      - name: Terraform validate
+        run: terraform validate -no-color
+
+      - name: Setup TFLint
+        uses: terraform-linters/setup-tflint@v4
+
+      - name: TFLint
+        run: |
+          tflint --init
+          tflint --recursive
+
+  security-validation:
+    name: Security validation
+    needs: terraform-validation
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Trivy infrastructure scan
+        uses: aquasecurity/trivy-action@0.35.0
+        with:
+          scan-type: config
+          scan-ref: .
+          format: table
+          exit-code: '1'
+          severity: CRITICAL
+
+      - name: Detect committed secrets
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

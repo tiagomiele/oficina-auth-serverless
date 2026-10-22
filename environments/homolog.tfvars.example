@@ -1,0 +1,26 @@
+aws_region  = "us-west-2"
+environment = "homolog"
+
+lambda_security_group_id = "sg-xxxxxxxx"
+private_subnet_ids        = ["subnet-xxxxxxxx", "subnet-yyyyyyyy"]
+backend_base_url    = null
+jwt_issuer          = "oficina-auth-serverless"
+jwt_audience        = "oficina-backend"
+jwt_ttl_seconds     = 900
+
+api_detailed_metrics_enabled = true
+
+notification_delivery_mode       = "log"
+notification_source_email        = "nao-responder@example.com"
+notification_create_ses_identity = false
+
+newrelic_instrumentation_enabled = false
+newrelic_layer_version           = 1
+newrelic_account_id              = ""
+newrelic_log_forwarding_enabled  = false
+
+# Configure como variáveis sensíveis no HCP Terraform:
+# db_url, db_user, db_password, jwt_private_key e notification_api_key.
+# Configure jwt_public_key no HCP e também no GitHub Environment do backend.
+# No AWS Academy, mantenha notification_delivery_mode=log e notification_create_ses_identity=false.
+# Configure newrelic_license_key como variável sensível antes de habilitar a instrumentação.
