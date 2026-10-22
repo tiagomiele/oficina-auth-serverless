@@ -45,3 +45,8 @@ output "notification_dlq_url" {
   description = "Fila que recebe notificações não entregues após as tentativas do SNS."
   value       = aws_sqs_queue.notification_dlq.url
 }
+
+output "mercadopago_webhook_url" {
+  description = "URL pública do webhook do Mercado Pago (MERCADOPAGO_NOTIFICATION_URL)."
+  value       = "${aws_apigatewayv2_api.main.api_endpoint}/webhooks/mercadopago"
+}

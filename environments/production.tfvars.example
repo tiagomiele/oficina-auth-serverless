@@ -4,6 +4,7 @@ environment = "production"
 lambda_security_group_id = "sg-xxxxxxxx"
 private_subnet_ids        = ["subnet-xxxxxxxx", "subnet-yyyyyyyy"]
 backend_base_url    = null
+orcamento_pagamento_base_url = null
 jwt_issuer          = "oficina-auth-serverless"
 jwt_audience        = "oficina-backend"
 jwt_ttl_seconds     = 900
