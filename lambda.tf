@@ -76,8 +76,10 @@ resource "aws_lambda_function" "authorizer" {
 
   filename         = var.lambda_package_path
   source_code_hash = filebase64sha256(var.lambda_package_path)
-  memory_size      = 384
-  timeout          = 10
+  # O API Gateway espera o authorizer por no máximo 10 s; com o agente Java do New Relic,
+  # o cold start com 384 MB passava desse limite e a rota respondia 500.
+  memory_size = 1024
+  timeout     = 10
 
   environment {
     variables = merge(
