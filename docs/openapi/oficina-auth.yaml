@@ -1,0 +1,325 @@
+openapi: 3.0.3
+info:
+  title: Oficina Auth Serverless
+  version: 1.0.0
+  description: |
+    Contrato do serviço serverless de autenticação por CPF, das rotas de cliente
+    protegidas pelo Lambda Authorizer e do ingresso técnico de notificações.
+servers:
+  - url: https://{apiId}.execute-api.{region}.amazonaws.com
+    description: HTTP API do ambiente
+    variables:
+      apiId:
+        default: replace-me
+      region:
+        default: us-west-2
+tags:
+  - name: autenticacao
+  - name: cliente
+  - name: notificacao
+paths:
+  /auth/cpf:
+    post:
+      tags: [autenticacao]
+      operationId: autenticarPorCpf
+      summary: Autentica o cliente por CPF e emite um JWT de curta duração
+      description: |
+        Rota pública. A resposta é genérica para CPF inválido, inexistente ou inativo,
+        evitando enumeração de clientes. O CPF nunca aparece em logs ou no token.
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AutenticacaoRequest'
+            examples:
+              comMascara:
+                value:
+                  cpf: 000.000.000-00
+              semMascara:
+                value:
+                  cpf: '00000000000'
+      responses:
+        '200':
+          description: Token emitido
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AutenticacaoResponse'
+        '400':
+          description: Corpo ausente, campo cpf ausente ou JSON inválido
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Erro'
+              example:
+                code: INVALID_REQUEST
+                message: Informe o campo cpf.
+                requestId: 8f0c1b2d
+        '401':
+          description: Autenticação recusada, sem distinção entre causas
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Erro'
+              example:
+                code: AUTHENTICATION_FAILED
+                message: Não foi possível autenticar o cliente.
+                requestId: 8f0c1b2d
+        '500':
+          description: Falha interna sem detalhes técnicos no corpo
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Erro'
+  /internal/notifications:
+    post:
+      tags: [notificacao]
+      operationId: publicarNotificacao
+      summary: Publica uma notificação para processamento assíncrono
+      description: |
+        Rota técnica consumida exclusivamente pelo backend. A Lambda valida a chave
+        compartilhada, limita o payload e publica a mensagem no SNS. O destinatário,
+        o assunto, o corpo e a credencial não são registrados nos logs técnicos.
+      security:
+        - notificationKey: []
+      parameters:
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NotificacaoRequest'
+      responses:
+        '202':
+          description: Notificação aceita para processamento
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+        '400':
+          description: Payload inválido
+        '401':
+          description: Credencial técnica inválida
+        '503':
+          description: Publicação temporariamente indisponível
+  /consulta/ordens-servico/{numeroOs}/status:
+    get:
+      tags: [cliente]
+      operationId: consultarStatusOs
+      summary: Consulta o status da OS do cliente autenticado
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/NumeroOs'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          $ref: '#/components/responses/RepassadaAoBackend'
+        '401':
+          $ref: '#/components/responses/AuthorizerDeny'
+        '403':
+          $ref: '#/components/responses/AuthorizerDeny'
+  /ordens-servico/{numeroOs}/historico:
+    get:
+      tags: [cliente]
+      operationId: consultarHistoricoOs
+      summary: Consulta o histórico da OS do cliente autenticado
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/NumeroOs'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          $ref: '#/components/responses/RepassadaAoBackend'
+        '401':
+          $ref: '#/components/responses/AuthorizerDeny'
+        '403':
+          $ref: '#/components/responses/AuthorizerDeny'
+  /ordens-servico/{numeroOs}/aprovar:
+    post:
+      tags: [cliente]
+      operationId: aprovarOrcamento
+      summary: Aprova o orçamento da OS
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/NumeroOs'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          $ref: '#/components/responses/RepassadaAoBackend'
+        '401':
+          $ref: '#/components/responses/AuthorizerDeny'
+        '403':
+          $ref: '#/components/responses/AuthorizerDeny'
+  /ordens-servico/{numeroOs}/rejeitar-refazer:
+    post:
+      tags: [cliente]
+      operationId: rejeitarOrcamentoRefazer
+      summary: Rejeita o orçamento solicitando novo diagnóstico
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/NumeroOs'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          $ref: '#/components/responses/RepassadaAoBackend'
+        '401':
+          $ref: '#/components/responses/AuthorizerDeny'
+        '403':
+          $ref: '#/components/responses/AuthorizerDeny'
+  /ordens-servico/{numeroOs}/rejeitar-cancelar:
+    post:
+      tags: [cliente]
+      operationId: rejeitarOrcamentoCancelar
+      summary: Rejeita o orçamento cancelando a OS
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/NumeroOs'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          $ref: '#/components/responses/RepassadaAoBackend'
+        '401':
+          $ref: '#/components/responses/AuthorizerDeny'
+        '403':
+          $ref: '#/components/responses/AuthorizerDeny'
+  /ordens-servico/{numeroOs}/confirmar-pagamento:
+    post:
+      tags: [cliente]
+      operationId: confirmarPagamento
+      summary: Confirma o pagamento da OS
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/NumeroOs'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          $ref: '#/components/responses/RepassadaAoBackend'
+        '401':
+          $ref: '#/components/responses/AuthorizerDeny'
+        '403':
+          $ref: '#/components/responses/AuthorizerDeny'
+components:
+  securitySchemes:
+    notificationKey:
+      type: apiKey
+      in: header
+      name: X-Notification-Key
+      description: Chave compartilhada armazenada como secret nos ambientes HCP e GitHub.
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        Token emitido por POST /auth/cpf. O Lambda Authorizer valida assinatura RS256,
+        emissor, audiência, expiração e a role CLIENTE, e repassa subject, clientId,
+        role e requestId ao backend no contexto do autorizador.
+  parameters:
+    NumeroOs:
+      name: numeroOs
+      in: path
+      required: true
+      schema:
+        type: string
+    RequestId:
+      name: X-Request-Id
+      in: header
+      required: false
+      description: Identificador de correlação. Quando ausente, o API Gateway gera e propaga o seu.
+      schema:
+        type: string
+        maxLength: 64
+  headers:
+    RequestId:
+      description: Identificador de correlação da requisição.
+      schema:
+        type: string
+  responses:
+    RepassadaAoBackend:
+      description: Resposta produzida pelo backend no EKS
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/json:
+          schema:
+            type: object
+            additionalProperties: true
+    AuthorizerDeny:
+      description: Token ausente, inválido, expirado ou com emissor/audiência incorretos
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Erro'
+  schemas:
+    NotificacaoRequest:
+      type: object
+      required: [destinatario, assunto, corpo]
+      additionalProperties: false
+      properties:
+        destinatario:
+          type: string
+          format: email
+          maxLength: 320
+        assunto:
+          type: string
+          minLength: 1
+          maxLength: 200
+        corpo:
+          type: string
+          minLength: 1
+          maxLength: 5000
+    AutenticacaoRequest:
+      type: object
+      required: [cpf]
+      properties:
+        cpf:
+          type: string
+          description: CPF com ou sem máscara.
+          minLength: 11
+          maxLength: 14
+    AutenticacaoResponse:
+      type: object
+      required: [accessToken, tokenType, expiresIn]
+      properties:
+        accessToken:
+          type: string
+          description: JWT RS256 com claims sub, client_id, role, iss, aud, iat, exp e jti.
+        tokenType:
+          type: string
+          enum: [Bearer]
+        expiresIn:
+          type: integer
+          format: int64
+          description: Validade em segundos.
+    Erro:
+      type: object
+      required: [code, message, requestId]
+      properties:
+        code:
+          type: string
+          enum: [INVALID_REQUEST, AUTHENTICATION_FAILED, INTERNAL_ERROR]
+        message:
+          type: string
+        requestId:
+          type: string

@@ -1,0 +1,4 @@
+.git/
+.terraform/
+target/*
+!target/oficina-auth.jar

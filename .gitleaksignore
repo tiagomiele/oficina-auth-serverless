@@ -1,0 +1,2 @@
+# Chave RSA gerada em memória por teste; removida no commit seguinte.
+1df0f1555a715af40c1c954419762dc99147c87f:src/test/java/br/com/oficina/auth/infrastructure/JwtServiceTest.java:private-key:38
