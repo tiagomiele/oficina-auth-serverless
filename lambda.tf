@@ -24,8 +24,10 @@ resource "aws_lambda_function" "login" {
 
   filename         = var.lambda_package_path
   source_code_hash = filebase64sha256(var.lambda_package_path)
-  memory_size      = 512
-  timeout          = 15
+  # Com 512 MB, a inicialização da JVM com o agente Java do New Relic passava dos 15 s
+  # do API Gateway em cold start; 1024 MB dá mais CPU à função, como no authorizer.
+  memory_size = 1024
+  timeout     = 15
 
   vpc_config {
     subnet_ids         = var.private_subnet_ids
