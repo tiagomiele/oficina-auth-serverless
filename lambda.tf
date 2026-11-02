@@ -42,11 +42,11 @@ resource "aws_lambda_function" "login" {
         OS_SERVICE_BASE_URL = var.backend_base_url == null ? "" : var.backend_base_url
         INTERNAL_API_KEY    = var.notification_api_key
         JWT_PRIVATE_KEY     = var.jwt_private_key
-        JWT_PUBLIC_KEY  = var.jwt_public_key
-        JWT_ISSUER      = var.jwt_issuer
-        JWT_AUDIENCE    = var.jwt_audience
-        JWT_TTL_SECONDS = tostring(var.jwt_ttl_seconds)
-        ENVIRONMENT     = var.environment
+        JWT_PUBLIC_KEY      = var.jwt_public_key
+        JWT_ISSUER          = var.jwt_issuer
+        JWT_AUDIENCE        = var.jwt_audience
+        JWT_TTL_SECONDS     = tostring(var.jwt_ttl_seconds)
+        ENVIRONMENT         = var.environment
       },
       local.newrelic_environment
     )
