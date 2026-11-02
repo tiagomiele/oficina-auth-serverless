@@ -1,6 +1,6 @@
 package br.com.oficina.auth.infrastructure.config;
 
-import br.com.oficina.auth.adapter.out.jdbc.JdbcClientRepository;
+import br.com.oficina.auth.adapter.out.http.OsServiceClientRepository;
 import br.com.oficina.auth.adapter.out.jwt.JwtTokenAdapter;
 import br.com.oficina.auth.adapter.out.newrelic.NewRelicAccessLogAdapter;
 import br.com.oficina.auth.adapter.out.ses.SesNotificationAdapter;
@@ -33,7 +33,7 @@ public final class AuthComposition {
     JwtTokenAdapter tokens = new JwtTokenAdapter(config);
     return new LoginDependencies(
         new AuthenticateClientUseCase(
-            new JdbcClientRepository(config), tokens, config.jwtTtlSeconds()),
+            new OsServiceClientRepository(config), tokens, config.jwtTtlSeconds()),
         Telemetry.fromEnvironment());
   }
 

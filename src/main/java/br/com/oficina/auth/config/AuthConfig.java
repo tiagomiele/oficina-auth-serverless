@@ -1,9 +1,8 @@
 package br.com.oficina.auth.config;
 
 public record AuthConfig(
-    String dbUrl,
-    String dbUser,
-    String dbPassword,
+    String osServiceBaseUrl,
+    String internalApiKey,
     String jwtPrivateKey,
     String jwtPublicKey,
     String jwtIssuer,
@@ -12,9 +11,8 @@ public record AuthConfig(
 
   public static AuthConfig loginFromEnvironment() {
     return new AuthConfig(
-        required("DB_URL"),
-        required("DB_USER"),
-        required("DB_PASSWORD"),
+        valueOrDefault("OS_SERVICE_BASE_URL", ""),
+        required("INTERNAL_API_KEY"),
         required("JWT_PRIVATE_KEY"),
         required("JWT_PUBLIC_KEY"),
         valueOrDefault("JWT_ISSUER", "oficina-auth-serverless"),
@@ -24,7 +22,6 @@ public record AuthConfig(
 
   public static AuthConfig authorizerFromEnvironment() {
     return new AuthConfig(
-        null,
         null,
         null,
         null,

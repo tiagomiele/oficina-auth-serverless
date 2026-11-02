@@ -21,7 +21,7 @@ newrelic_account_id              = ""
 newrelic_log_forwarding_enabled  = false
 
 # Configure como variáveis sensíveis no HCP Terraform:
-# db_url, db_user, db_password, jwt_private_key e notification_api_key.
+# jwt_private_key e notification_api_key.
 # Configure jwt_public_key no HCP e também no GitHub Environment do backend.
 # No AWS Academy, mantenha notification_delivery_mode=log e notification_create_ses_identity=false.
 # Configure newrelic_license_key como variável sensível antes de habilitar a instrumentação.

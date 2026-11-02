@@ -19,7 +19,6 @@ class JwtServiceTest {
         new AuthConfig(
             null,
             null,
-            null,
             encoded(pair.getPrivate()),
             encoded(pair.getPublic()),
             "oficina-auth-serverless",
