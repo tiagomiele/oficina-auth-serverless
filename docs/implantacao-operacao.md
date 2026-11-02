@@ -15,8 +15,8 @@ Pull Requests para `homolog` ou `main` calculam as mudanças do ambiente corresp
 - `homolog` utiliza workspace e GitHub Environment de homologação.
 - `main` utiliza workspace e Environment `production` protegido.
 - O apply cria Lambdas, API Gateway, rotas, Authorizer, SNS, DLQ e telemetria.
-- As URLs resultantes são sincronizadas com o Backend.
+- As URLs resultantes são sincronizadas com o GitHub Environment do `oficina-os-service` (`API_GATEWAY_BASE_URL`, `AUTH_BASE_URL`, `NOTIFICATION_ENDPOINT`).
 
 ## Evidência
 
-[Deploy de Auth concluído](https://github.com/tiagomiele/fiap-tech-challenge-fase3-oficina-auth-serverless/actions/runs/34543127750)
+Execuções: aba [Actions](https://github.com/tiagomiele/oficina-auth-serverless/actions). Detalhes no [README](../README.md#9-cicd).

@@ -1,13 +1,32 @@
 openapi: 3.0.3
 info:
-  title: Oficina Auth Serverless
-  version: 1.0.0
+  title: Oficina Auth Serverless (API Gateway)
+  version: 2.0.0
   description: |
-    Contrato do serviço serverless de autenticação por CPF, das rotas de cliente
-    protegidas pelo Lambda Authorizer e do ingresso técnico de notificações.
+    Contrato do HTTP API (API Gateway v2) da Oficina na Fase 4.
+
+    **Como usar:**
+    1. `POST /auth/cpf` com o CPF de um cliente ativo → recebe `accessToken` (JWT RS256, 15 min).
+    2. Envie `Authorization: Bearer <accessToken>` nas rotas do cliente. O Lambda Authorizer
+       valida assinatura, emissor (`oficina-auth-serverless`), audiência (`oficina-backend`),
+       expiração e o papel `CLIENTE` antes de repassar a chamada ao serviço no EKS.
+
+    **Quem responde cada rota:**
+    - `/auth/cpf` e `/internal/notifications`: Lambdas deste repositório.
+    - `/consulta/...` e `/ordens-servico/.../historico`: OS Service (EKS).
+    - `/orcamentos/...`, `/pagamentos/...` e `/webhooks/mercadopago`: Orçamento e Pagamento (EKS).
+
+    **Erros do API Gateway (antes de chegar ao serviço):**
+    - `401 {"message":"Unauthorized"}`: sem cabeçalho `Authorization`.
+    - `403 {"message":"Forbidden"}`: token inválido, expirado, de outro emissor/audiência ou sem papel `CLIENTE`.
+    - `429 {"message":"Too Many Requests"}`: acima de 10 req/s (rajada de 20).
+    - `503/504`: serviço no EKS indisponível ou lento.
+
+    A URL base muda a cada recriação do ambiente: use o output `api_base_url` do Terraform
+    (ou a variável `API_GATEWAY_BASE_URL` do GitHub Environment do `oficina-os-service`).
 servers:
   - url: https://{apiId}.execute-api.{region}.amazonaws.com
-    description: HTTP API do ambiente
+    description: HTTP API do ambiente (homolog ou production)
     variables:
       apiId:
         default: replace-me
@@ -15,17 +34,26 @@ servers:
         default: us-west-2
 tags:
   - name: autenticacao
-  - name: cliente
+    description: Login do cliente por CPF (Lambda deste repositório)
+  - name: cliente-os
+    description: Consulta da OS (repassada ao OS Service)
+  - name: cliente-orcamento-pagamento
+    description: Orçamento e pagamento (repassadas ao Orçamento e Pagamento)
+  - name: webhook
+    description: Notificação do Mercado Pago (pública, validada por assinatura no serviço)
   - name: notificacao
+    description: Ingresso técnico de notificações (Lambda deste repositório)
 paths:
   /auth/cpf:
     post:
       tags: [autenticacao]
       operationId: autenticarPorCpf
-      summary: Autentica o cliente por CPF e emite um JWT de curta duração
+      summary: Autentica o cliente por CPF e emite um JWT de 15 minutos
       description: |
-        Rota pública. A resposta é genérica para CPF inválido, inexistente ou inativo,
-        evitando enumeração de clientes. O CPF nunca aparece em logs ou no token.
+        Rota pública. O CPF é normalizado (aceita com ou sem máscara), validado pelos dígitos
+        verificadores e procurado em `clientes` (cliente ativo, `tipo_documento = 'CPF'`).
+        A resposta 401 é a mesma para CPF inválido, inexistente ou inativo, evitando
+        enumeração de clientes. O CPF não vai para logs nem para o token.
       parameters:
         - $ref: '#/components/parameters/RequestId'
       requestBody:
@@ -36,11 +64,13 @@ paths:
               $ref: '#/components/schemas/AutenticacaoRequest'
             examples:
               comMascara:
+                summary: CPF com máscara
                 value:
-                  cpf: 000.000.000-00
+                  cpf: 529.982.247-25
               semMascara:
+                summary: CPF só com dígitos
                 value:
-                  cpf: '00000000000'
+                  cpf: '52998224725'
       responses:
         '200':
           description: Token emitido
@@ -51,8 +81,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/AutenticacaoResponse'
+              example:
+                accessToken: <jwt-rs256-emitido-pelo-login>
+                tokenType: Bearer
+                expiresIn: 900
         '400':
-          description: Corpo ausente, campo cpf ausente ou JSON inválido
+          description: Corpo sem `cpf` ou JSON inválido
           headers:
             X-Request-Id:
               $ref: '#/components/headers/RequestId'
@@ -60,12 +94,19 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Erro'
-              example:
-                code: INVALID_REQUEST
-                message: Informe o campo cpf.
-                requestId: 8f0c1b2d
+              examples:
+                semCpf:
+                  value:
+                    code: INVALID_REQUEST
+                    message: Informe o campo cpf.
+                    requestId: Hk3sZgk2PHcEJpA=
+                jsonInvalido:
+                  value:
+                    code: INVALID_REQUEST
+                    message: Corpo JSON inválido.
+                    requestId: Hk3sZgk2PHcEJpA=
         '401':
-          description: Autenticação recusada, sem distinção entre causas
+          description: CPF inválido, inexistente ou cliente inativo (resposta única)
           headers:
             X-Request-Id:
               $ref: '#/components/headers/RequestId'
@@ -76,9 +117,11 @@ paths:
               example:
                 code: AUTHENTICATION_FAILED
                 message: Não foi possível autenticar o cliente.
-                requestId: 8f0c1b2d
+                requestId: Hk3sZgk2PHcEJpA=
+        '429':
+          $ref: '#/components/responses/LimiteExcedido'
         '500':
-          description: Falha interna sem detalhes técnicos no corpo
+          description: Falha interna (ex. banco indisponível), sem detalhes técnicos
           headers:
             X-Request-Id:
               $ref: '#/components/headers/RequestId'
@@ -86,15 +129,250 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Erro'
+              example:
+                code: INTERNAL_ERROR
+                message: Não foi possível processar a autenticação.
+                requestId: Hk3sZgk2PHcEJpA=
+  /consulta/ordens-servico/{numeroOs}/status:
+    get:
+      tags: [cliente-os]
+      operationId: consultarStatusOs
+      summary: Status da OS do cliente (OS Service)
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/NumeroOs'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: Status atual da OS
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusOsResponse'
+              example:
+                numeroOs: OS-102026-000003
+                status: AGUARDANDO_PAGAMENTO
+                statusDescricao: Aguardando pagamento
+        '401':
+          $ref: '#/components/responses/SemToken'
+        '403':
+          $ref: '#/components/responses/TokenRecusado'
+        '404':
+          $ref: '#/components/responses/NaoEncontradaNoServico'
+  /ordens-servico/{numeroOs}/historico:
+    get:
+      tags: [cliente-os]
+      operationId: consultarHistoricoOs
+      summary: Histórico de status da OS do cliente (OS Service)
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/NumeroOs'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          $ref: '#/components/responses/RepassadaAoServico'
+        '401':
+          $ref: '#/components/responses/SemToken'
+        '403':
+          $ref: '#/components/responses/TokenRecusado'
+        '404':
+          $ref: '#/components/responses/NaoEncontradaNoServico'
+  /orcamentos/{numeroOs}:
+    get:
+      tags: [cliente-orcamento-pagamento]
+      operationId: consultarOrcamento
+      summary: Orçamento da OS com itens e valor total (Orçamento e Pagamento)
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/NumeroOs'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: Orçamento
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrcamentoResponse'
+              example:
+                numeroOs: OS-102026-000003
+                status: AGUARDANDO_APROVACAO
+                valorTotal: 150.00
+                itens:
+                  - {tipo: SERVICO, idServicoSku: '7', descricao: Troca de óleo, quantidade: 1, precoUnitario: 120.00}
+                  - {tipo: PECA, idServicoSku: FILTRO-01, descricao: Filtro de óleo, quantidade: 1, precoUnitario: 30.00}
+                atualizadoEm: '2026-10-30T21:39:00Z'
+        '401':
+          $ref: '#/components/responses/SemToken'
+        '403':
+          $ref: '#/components/responses/TokenRecusadoOuOsDeOutroCliente'
+        '404':
+          $ref: '#/components/responses/NaoEncontradaNoServico'
+  /orcamentos/{numeroOs}/aprovar:
+    post:
+      tags: [cliente-orcamento-pagamento]
+      operationId: aprovarOrcamento
+      summary: Cliente aprova o orçamento; a Saga segue para o reparo
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/NumeroOs'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: Orçamento APROVADO (publica ORCAMENTO_APROVADO)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrcamentoResponse'
+        '401':
+          $ref: '#/components/responses/SemToken'
+        '403':
+          $ref: '#/components/responses/TokenRecusadoOuOsDeOutroCliente'
+        '404':
+          $ref: '#/components/responses/NaoEncontradaNoServico'
+        '409':
+          $ref: '#/components/responses/TransicaoInvalida'
+  /orcamentos/{numeroOs}/rejeitar:
+    post:
+      tags: [cliente-orcamento-pagamento]
+      operationId: rejeitarOrcamento
+      summary: Cliente rejeita o orçamento (REFAZER volta ao diagnóstico, CANCELAR cancela a OS)
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/NumeroOs'
+        - $ref: '#/components/parameters/RequestId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RejeicaoRequest'
+            examples:
+              refazer:
+                value: {acao: REFAZER, motivo: Valor acima do esperado}
+              cancelar:
+                value: {acao: CANCELAR, motivo: Desisti do reparo}
+      responses:
+        '200':
+          description: Orçamento REJEITADO (publica ORCAMENTO_REJEITADO)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrcamentoResponse'
+        '400':
+          description: '`acao` ausente/inválida ou `motivo` com mais de 500 caracteres'
+        '401':
+          $ref: '#/components/responses/SemToken'
+        '403':
+          $ref: '#/components/responses/TokenRecusadoOuOsDeOutroCliente'
+        '404':
+          $ref: '#/components/responses/NaoEncontradaNoServico'
+        '409':
+          $ref: '#/components/responses/TransicaoInvalida'
+  /pagamentos/{numeroOs}:
+    get:
+      tags: [cliente-orcamento-pagamento]
+      operationId: consultarPagamento
+      summary: Cobrança da OS com o link do Mercado Pago
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/NumeroOs'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: Pagamento
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PagamentoResponse'
+              example:
+                numeroOs: OS-102026-000003
+                status: PENDENTE
+                provedor: mercadopago
+                valor: 150.00
+                linkPagamento: https://sandbox.mercadopago.com.br/checkout/v1/redirect?pref_id=3796230935-f8cb
+        '401':
+          $ref: '#/components/responses/SemToken'
+        '403':
+          $ref: '#/components/responses/TokenRecusadoOuOsDeOutroCliente'
+        '404':
+          $ref: '#/components/responses/NaoEncontradaNoServico'
+  /pagamentos/{numeroOs}/nova-tentativa:
+    post:
+      tags: [cliente-orcamento-pagamento]
+      operationId: novaTentativaPagamento
+      summary: Gera nova cobrança depois de um pagamento recusado
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/NumeroOs'
+        - $ref: '#/components/parameters/RequestId'
+      responses:
+        '200':
+          description: Nova cobrança PENDENTE com novo link
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PagamentoResponse'
+        '401':
+          $ref: '#/components/responses/SemToken'
+        '403':
+          $ref: '#/components/responses/TokenRecusadoOuOsDeOutroCliente'
+        '404':
+          $ref: '#/components/responses/NaoEncontradaNoServico'
+        '409':
+          $ref: '#/components/responses/TransicaoInvalida'
+  /webhooks/mercadopago:
+    post:
+      tags: [webhook]
+      operationId: webhookMercadoPago
+      summary: Aviso de pagamento do Mercado Pago (sem JWT)
+      description: |
+        Rota pública sem authorizer. O Orçamento e Pagamento valida o cabeçalho
+        `x-signature` (HMAC com a assinatura secreta do painel) e consulta o pagamento
+        na API do Mercado Pago antes de mudar o status. Configure esta URL no painel
+        do Mercado Pago (output `mercadopago_webhook_url`).
+      parameters:
+        - name: x-signature
+          in: header
+          required: true
+          schema: {type: string}
+          example: ts=1793396918,v1=8f3c0e...
+        - name: x-request-id
+          in: header
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+            example:
+              action: payment.updated
+              type: payment
+              data: {id: '185889123735'}
+      responses:
+        '200':
+          description: Aviso recebido (processado ou ignorado de forma idempotente)
+        '401':
+          description: Assinatura `x-signature` ausente ou inválida
   /internal/notifications:
     post:
       tags: [notificacao]
       operationId: publicarNotificacao
-      summary: Publica uma notificação para processamento assíncrono
+      summary: Publica uma notificação para entrega assíncrona (uso técnico do OS Service)
       description: |
-        Rota técnica consumida exclusivamente pelo backend. A Lambda valida a chave
-        compartilhada, limita o payload e publica a mensagem no SNS. O destinatário,
-        o assunto, o corpo e a credencial não são registrados nos logs técnicos.
+        Usada pelo OS Service quando `NOTIFICACAO_TIPO=serverless`. A Lambda compara a chave
+        `X-Notification-Key` em tempo constante, valida o payload e publica no SNS. A Lambda de
+        entrega envia por SES (modo `ses`) ou só registra (modo `log`, padrão no AWS Academy).
+        Falhas definitivas vão para a DLQ `oficina-auth-<env>-notification-dlq`.
       security:
         - notificationKey: []
       parameters:
@@ -105,147 +383,81 @@ paths:
           application/json:
             schema:
               $ref: '#/components/schemas/NotificacaoRequest'
+            example:
+              destinatario: cliente@example.com
+              assunto: Sua OS OS-102026-000003 está pronta
+              corpo: O reparo foi concluído. Aguardamos o pagamento.
       responses:
         '202':
-          description: Notificação aceita para processamento
-          headers:
-            X-Request-Id:
-              $ref: '#/components/headers/RequestId'
+          description: Notificação aceita
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NotificacaoAceita'
+              example:
+                status: ACCEPTED
+                requestId: Hk3sZgk2PHcEJpA=
         '400':
-          description: Payload inválido
+          description: Corpo ausente, JSON inválido, e-mail inválido ou campo acima do limite
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Erro'
+              example:
+                code: INVALID_REQUEST
+                message: Payload inválido.
+                requestId: Hk3sZgk2PHcEJpA=
         '401':
-          description: Credencial técnica inválida
+          description: '`X-Notification-Key` ausente ou diferente'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Erro'
+              example:
+                code: UNAUTHORIZED
+                message: Credencial inválida.
+                requestId: Hk3sZgk2PHcEJpA=
         '503':
-          description: Publicação temporariamente indisponível
-  /consulta/ordens-servico/{numeroOs}/status:
-    get:
-      tags: [cliente]
-      operationId: consultarStatusOs
-      summary: Consulta o status da OS do cliente autenticado
-      security:
-        - bearerAuth: []
-      parameters:
-        - $ref: '#/components/parameters/NumeroOs'
-        - $ref: '#/components/parameters/RequestId'
-      responses:
-        '200':
-          $ref: '#/components/responses/RepassadaAoBackend'
-        '401':
-          $ref: '#/components/responses/AuthorizerDeny'
-        '403':
-          $ref: '#/components/responses/AuthorizerDeny'
-  /ordens-servico/{numeroOs}/historico:
-    get:
-      tags: [cliente]
-      operationId: consultarHistoricoOs
-      summary: Consulta o histórico da OS do cliente autenticado
-      security:
-        - bearerAuth: []
-      parameters:
-        - $ref: '#/components/parameters/NumeroOs'
-        - $ref: '#/components/parameters/RequestId'
-      responses:
-        '200':
-          $ref: '#/components/responses/RepassadaAoBackend'
-        '401':
-          $ref: '#/components/responses/AuthorizerDeny'
-        '403':
-          $ref: '#/components/responses/AuthorizerDeny'
-  /ordens-servico/{numeroOs}/aprovar:
-    post:
-      tags: [cliente]
-      operationId: aprovarOrcamento
-      summary: Aprova o orçamento da OS
-      security:
-        - bearerAuth: []
-      parameters:
-        - $ref: '#/components/parameters/NumeroOs'
-        - $ref: '#/components/parameters/RequestId'
-      responses:
-        '200':
-          $ref: '#/components/responses/RepassadaAoBackend'
-        '401':
-          $ref: '#/components/responses/AuthorizerDeny'
-        '403':
-          $ref: '#/components/responses/AuthorizerDeny'
-  /ordens-servico/{numeroOs}/rejeitar-refazer:
-    post:
-      tags: [cliente]
-      operationId: rejeitarOrcamentoRefazer
-      summary: Rejeita o orçamento solicitando novo diagnóstico
-      security:
-        - bearerAuth: []
-      parameters:
-        - $ref: '#/components/parameters/NumeroOs'
-        - $ref: '#/components/parameters/RequestId'
-      responses:
-        '200':
-          $ref: '#/components/responses/RepassadaAoBackend'
-        '401':
-          $ref: '#/components/responses/AuthorizerDeny'
-        '403':
-          $ref: '#/components/responses/AuthorizerDeny'
-  /ordens-servico/{numeroOs}/rejeitar-cancelar:
-    post:
-      tags: [cliente]
-      operationId: rejeitarOrcamentoCancelar
-      summary: Rejeita o orçamento cancelando a OS
-      security:
-        - bearerAuth: []
-      parameters:
-        - $ref: '#/components/parameters/NumeroOs'
-        - $ref: '#/components/parameters/RequestId'
-      responses:
-        '200':
-          $ref: '#/components/responses/RepassadaAoBackend'
-        '401':
-          $ref: '#/components/responses/AuthorizerDeny'
-        '403':
-          $ref: '#/components/responses/AuthorizerDeny'
-  /ordens-servico/{numeroOs}/confirmar-pagamento:
-    post:
-      tags: [cliente]
-      operationId: confirmarPagamento
-      summary: Confirma o pagamento da OS
-      security:
-        - bearerAuth: []
-      parameters:
-        - $ref: '#/components/parameters/NumeroOs'
-        - $ref: '#/components/parameters/RequestId'
-      responses:
-        '200':
-          $ref: '#/components/responses/RepassadaAoBackend'
-        '401':
-          $ref: '#/components/responses/AuthorizerDeny'
-        '403':
-          $ref: '#/components/responses/AuthorizerDeny'
+          description: Falha ao publicar no SNS
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Erro'
+              example:
+                code: SERVICE_UNAVAILABLE
+                message: Não foi possível aceitar a notificação.
+                requestId: Hk3sZgk2PHcEJpA=
 components:
   securitySchemes:
     notificationKey:
       type: apiKey
       in: header
       name: X-Notification-Key
-      description: Chave compartilhada armazenada como secret nos ambientes HCP e GitHub.
+      description: Chave compartilhada (`notification_api_key` no HCP e `NOTIFICATION_API_KEY` no OS Service).
     bearerAuth:
       type: http
       scheme: bearer
       bearerFormat: JWT
       description: |
-        Token emitido por POST /auth/cpf. O Lambda Authorizer valida assinatura RS256,
-        emissor, audiência, expiração e a role CLIENTE, e repassa subject, clientId,
-        role e requestId ao backend no contexto do autorizador.
+        Token de `POST /auth/cpf`. Claims: `sub` e `client_id` (id do cliente), `role=CLIENTE`,
+        `iss=oficina-auth-serverless`, `aud=oficina-backend`, `iat`, `exp` (15 min) e `jti`.
+        O authorizer repassa `subject`, `clientId`, `role` e `requestId` no contexto; os
+        serviços no EKS validam o mesmo token com a chave pública (`SERVERLESS_JWT_PUBLIC_KEY`).
+        Resultado do authorizer fica em cache por 300 s por token.
   parameters:
     NumeroOs:
       name: numeroOs
       in: path
       required: true
+      description: Número da OS no formato OS-MMAAAA-NNNNNN
       schema:
         type: string
+        example: OS-102026-000003
     RequestId:
       name: X-Request-Id
       in: header
       required: false
-      description: Identificador de correlação. Quando ausente, o API Gateway gera e propaga o seu.
+      description: Correlação. Se ausente, o API Gateway usa o próprio requestId e o repassa ao serviço.
       schema:
         type: string
         maxLength: 64
@@ -255,71 +467,184 @@ components:
       schema:
         type: string
   responses:
-    RepassadaAoBackend:
-      description: Resposta produzida pelo backend no EKS
-      headers:
-        X-Request-Id:
-          $ref: '#/components/headers/RequestId'
+    RepassadaAoServico:
+      description: Resposta produzida pelo serviço no EKS
       content:
         application/json:
           schema:
             type: object
             additionalProperties: true
-    AuthorizerDeny:
-      description: Token ausente, inválido, expirado ou com emissor/audiência incorretos
+    SemToken:
+      description: Cabeçalho Authorization ausente (resposta do API Gateway)
       content:
         application/json:
           schema:
-            $ref: '#/components/schemas/Erro'
+            $ref: '#/components/schemas/ErroGateway'
+          example:
+            message: Unauthorized
+    TokenRecusado:
+      description: Token inválido, expirado, de outro emissor/audiência ou sem papel CLIENTE (Lambda Authorizer)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErroGateway'
+          example:
+            message: Forbidden
+    TokenRecusadoOuOsDeOutroCliente:
+      description: |
+        Token recusado pelo authorizer (`{"message":"Forbidden"}`) ou OS de outro cliente
+        (Problem Details do serviço).
+      content:
+        application/json:
+          schema:
+            oneOf:
+              - $ref: '#/components/schemas/ErroGateway'
+              - $ref: '#/components/schemas/ProblemDetail'
+          examples:
+            authorizer:
+              value: {message: Forbidden}
+            osDeOutroCliente:
+              value:
+                type: about:blank
+                title: Forbidden
+                status: 403
+                detail: A OS OS-102026-000003 não pertence ao cliente autenticado
+                instance: /orcamentos/OS-102026-000003
+    NaoEncontradaNoServico:
+      description: OS, orçamento ou cobrança não encontrados (Problem Details do serviço)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetail'
+          example:
+            type: about:blank
+            title: Not Found
+            status: 404
+            detail: Orçamento da OS OS-102026-000003 não encontrado
+            instance: /orcamentos/OS-102026-000003
+    TransicaoInvalida:
+      description: Ação fora de ordem para o status atual (Problem Details do serviço)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetail'
+          example:
+            type: about:blank
+            title: Conflict
+            status: 409
+            detail: Não é possível ir de PAGO para PAGAMENTO_PENDENTE
+            instance: /pagamentos/OS-102026-000003/nova-tentativa
+    LimiteExcedido:
+      description: Acima de 10 req/s (rajada de 20) no stage
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErroGateway'
+          example:
+            message: Too Many Requests
   schemas:
-    NotificacaoRequest:
-      type: object
-      required: [destinatario, assunto, corpo]
-      additionalProperties: false
-      properties:
-        destinatario:
-          type: string
-          format: email
-          maxLength: 320
-        assunto:
-          type: string
-          minLength: 1
-          maxLength: 200
-        corpo:
-          type: string
-          minLength: 1
-          maxLength: 5000
     AutenticacaoRequest:
       type: object
       required: [cpf]
       properties:
         cpf:
           type: string
-          description: CPF com ou sem máscara.
+          description: CPF com ou sem máscara; precisa ter dígitos verificadores válidos.
           minLength: 11
           maxLength: 14
+          example: 529.982.247-25
     AutenticacaoResponse:
       type: object
       required: [accessToken, tokenType, expiresIn]
       properties:
         accessToken:
           type: string
-          description: JWT RS256 com claims sub, client_id, role, iss, aud, iat, exp e jti.
+          description: JWT RS256 assinado com a chave privada da Lambda de login.
         tokenType:
           type: string
           enum: [Bearer]
         expiresIn:
           type: integer
           format: int64
-          description: Validade em segundos.
+          description: Validade em segundos (`jwt_ttl_seconds`, padrão 900).
+          example: 900
+    StatusOsResponse:
+      type: object
+      properties:
+        numeroOs: {type: string, example: OS-102026-000003}
+        status:
+          type: string
+          enum: [RECEBIDA, EM_DIAGNOSTICO, AGUARDANDO_APROVACAO, EM_EXECUCAO, AGUARDANDO_PAGAMENTO, PAGA, ENTREGUE, CANCELADA]
+        statusDescricao: {type: string, example: Aguardando pagamento}
+    ItemOrcamento:
+      type: object
+      properties:
+        tipo: {type: string, enum: [SERVICO, PECA]}
+        idServicoSku: {type: string, example: FILTRO-01}
+        descricao: {type: string, example: Filtro de óleo}
+        quantidade: {type: integer, example: 1}
+        precoUnitario: {type: number, example: 30.00}
+    OrcamentoResponse:
+      type: object
+      properties:
+        numeroOs: {type: string, example: OS-102026-000003}
+        status: {type: string, enum: [AGUARDANDO_APROVACAO, APROVADO, REJEITADO, PAGAMENTO_PENDENTE, PAGO, PAGAMENTO_RECUSADO, CANCELADO]}
+        valorTotal: {type: number, example: 150.00}
+        itens:
+          type: array
+          items:
+            $ref: '#/components/schemas/ItemOrcamento'
+        motivo: {type: string, description: Preenchido quando rejeitado}
+        atualizadoEm: {type: string, format: date-time}
+    RejeicaoRequest:
+      type: object
+      required: [acao]
+      properties:
+        acao: {type: string, enum: [REFAZER, CANCELAR]}
+        motivo: {type: string, maxLength: 500}
+    PagamentoResponse:
+      type: object
+      properties:
+        numeroOs: {type: string, example: OS-102026-000003}
+        status: {type: string, enum: [PENDENTE, APROVADO, RECUSADO]}
+        provedor: {type: string, enum: [fake, mercadopago]}
+        valor: {type: number, example: 150.00}
+        linkPagamento: {type: string, description: Link do Checkout Pro (sandbox)}
+        comprovante: {type: string, description: Id do pagamento no Mercado Pago quando aprovado}
+        detalhe: {type: string, description: Motivo da recusa quando RECUSADO}
+    NotificacaoRequest:
+      type: object
+      required: [destinatario, assunto, corpo]
+      properties:
+        destinatario: {type: string, format: email, maxLength: 320}
+        assunto: {type: string, minLength: 1, maxLength: 200}
+        corpo: {type: string, minLength: 1, maxLength: 5000}
+    NotificacaoAceita:
+      type: object
+      properties:
+        status: {type: string, enum: [ACCEPTED]}
+        requestId: {type: string}
     Erro:
       type: object
+      description: Erro das Lambdas deste repositório
       required: [code, message, requestId]
       properties:
         code:
           type: string
-          enum: [INVALID_REQUEST, AUTHENTICATION_FAILED, INTERNAL_ERROR]
-        message:
-          type: string
-        requestId:
-          type: string
+          enum: [INVALID_REQUEST, AUTHENTICATION_FAILED, INTERNAL_ERROR, UNAUTHORIZED, SERVICE_UNAVAILABLE]
+        message: {type: string}
+        requestId: {type: string}
+    ErroGateway:
+      type: object
+      description: Corpo padrão do API Gateway (authorizer, limite, integração)
+      properties:
+        message: {type: string, enum: [Unauthorized, Forbidden, Too Many Requests, Internal Server Error, Service Unavailable]}
+    ProblemDetail:
+      type: object
+      description: RFC 7807, devolvido pelos serviços Spring Boot no EKS
+      properties:
+        type: {type: string}
+        title: {type: string}
+        status: {type: integer}
+        detail: {type: string}
+        instance: {type: string}
