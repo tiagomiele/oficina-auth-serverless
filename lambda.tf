@@ -29,6 +29,7 @@ resource "aws_lambda_function" "login" {
   memory_size = 1024
   timeout     = 15
 
+  # Na VPC, a função sai pela NAT para o LoadBalancer do OS Service.
   vpc_config {
     subnet_ids         = var.private_subnet_ids
     security_group_ids = [var.lambda_security_group_id]
@@ -37,10 +38,10 @@ resource "aws_lambda_function" "login" {
   environment {
     variables = merge(
       {
-        DB_URL          = var.db_url
-        DB_USER         = var.db_user
-        DB_PASSWORD     = var.db_password
-        JWT_PRIVATE_KEY = var.jwt_private_key
+        # O cliente é consultado no OS Service por REST; o Auth não acessa o banco do OS.
+        OS_SERVICE_BASE_URL = var.backend_base_url == null ? "" : var.backend_base_url
+        INTERNAL_API_KEY    = var.notification_api_key
+        JWT_PRIVATE_KEY     = var.jwt_private_key
         JWT_PUBLIC_KEY  = var.jwt_public_key
         JWT_ISSUER      = var.jwt_issuer
         JWT_AUDIENCE    = var.jwt_audience

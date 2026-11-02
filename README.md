@@ -19,7 +19,7 @@ Porta de entrada pública da Oficina: **login do cliente por CPF**, **Lambda Aut
 | # | Requisito | Onde no código |
 |---|---|---|
 | RF1 | Login por CPF com ou sem máscara, com validação dos dígitos | `domain/Cpf.java`, `handler/CpfAuthenticationHandler.java` |
-| RF2 | Só cliente ativo com documento CPF autentica | `adapter/out/jdbc/JdbcClientRepository.java` |
+| RF2 | Só cliente ativo com documento CPF autentica (consulta ao OS Service, sem acesso ao banco) | `adapter/out/http/OsServiceClientRepository.java` |
 | RF3 | Token JWT RS256 com `sub`, `client_id`, `role=CLIENTE`, `iss`, `aud`, `exp`, `jti` | `adapter/out/jwt/JwtTokenAdapter.java` |
 | RF4 | Rotas do cliente protegidas pelo authorizer | `handler/JwtAuthorizerHandler.java`, `apigateway.tf` |
 | RF5 | Rotas do cliente repassadas ao OS Service e ao Orçamento e Pagamento | `apigateway.tf` (`backend_route_keys`, `orcamento_pagamento_route_keys`) |
@@ -46,7 +46,7 @@ Porta de entrada pública da Oficina: **login do cliente por CPF**, **Lambda Aut
 |---|---|
 | Código | Java 21, Maven Wrapper, AWS Lambda Java Core/Events, Jackson |
 | Segurança | JJWT 0.12 (RS256), Lambda Authorizer REQUEST (payload 2.0, respostas simples) |
-| AWS | API Gateway HTTP API v2, Lambda `java21` arm64, RDS PostgreSQL (JDBC), SNS, SQS (DLQ), SES, CloudWatch Logs |
+| AWS | API Gateway HTTP API v2, Lambda `java21` arm64, SNS, SQS (DLQ), SES, CloudWatch Logs; `java.net.http.HttpClient` para consultar o OS Service |
 | Infraestrutura | Terraform + HCP Terraform (workspaces `homolog` e `production`) |
 | Qualidade | JUnit 5, ArchUnit, Spotless, TFLint, Trivy, Gitleaks, actionlint |
 | Observabilidade | logs JSON, camada New Relic Java (ARM64), log forwarder do API Gateway para o New Relic |
@@ -57,7 +57,7 @@ Porta de entrada pública da Oficina: **login do cliente por CPF**, **Lambda Aut
 
 | Lambda | Handler | Memória / timeout | Função |
 |---|---|---|---|
-| `oficina-auth-<env>-login` | `CpfAuthenticationHandler` | 1024 MB / 15 s (na VPC) | valida o CPF, consulta `clientes` e emite o JWT |
+| `oficina-auth-<env>-login` | `CpfAuthenticationHandler` | 1024 MB / 15 s (na VPC) | valida o CPF, consulta o cliente no OS Service por REST e emite o JWT |
 | `oficina-auth-<env>-authorizer` | `JwtAuthorizerHandler` | 1024 MB / 10 s | valida o token e devolve `isAuthorized` com `subject`, `clientId`, `role`, `requestId` |
 | `oficina-auth-<env>-notification-ingress` | `NotificationIngressHandler` | 512 MB / 18 s | valida a chave e o payload e publica no SNS |
 | `oficina-auth-<env>-notification-delivery` | `NotificationDeliveryHandler` | 384 MB / 30 s | entrega por SES ou só registra (modo `log`) |
@@ -113,14 +113,23 @@ Troque `<CPF de um cliente ativo>` pelo CPF cadastrado no OS Service, sem os sin
 
 ## 6. Banco de dados
 
-O Auth não tem banco próprio. A Lambda Login **só lê** a tabela `clientes` do RDS PostgreSQL do OS Service (provisionado pelo [oficina-database-infra](https://github.com/tiagomiele/oficina-database-infra)):
+O Auth **não tem banco e não acessa o banco de nenhum serviço**. Para saber se o CPF é de um cliente ativo, a Lambda Login chama a rota interna do OS Service, que é o dono da tabela `clientes`:
 
-```sql
-SELECT id_cliente FROM clientes
- WHERE documento_normalizado = ? AND tipo_documento = 'CPF' AND ativo = TRUE;
+```http
+POST <backend_base_url>/interno/clientes/autenticacao
+X-Api-Key: <notification_api_key>
+Content-Type: application/json
+
+{"cpf":"52998224725"}
 ```
 
-Para ver os clientes cadastrados, siga a seção de acesso ao banco do OS Service ([README](https://github.com/tiagomiele/oficina-os-service)).
+| Resposta do OS | Resultado do login |
+|---|---|
+| `200 {"idCliente": 1}` | emite o JWT com `sub = 1` |
+| `404` (CPF inválido, inexistente ou inativo) | `401 AUTHENTICATION_FAILED` |
+| outro status, timeout ou `backend_base_url` vazia | `500 INTERNAL_ERROR` |
+
+Código: [`OsServiceClientRepository`](src/main/java/br/com/oficina/auth/adapter/out/http/OsServiceClientRepository.java). Para ver os clientes cadastrados, siga a seção de acesso ao banco do [Database Infra](https://github.com/tiagomiele/oficina-database-infra#readme).
 
 ## 7. Executar e validar localmente
 
@@ -142,13 +151,12 @@ Exemplos: [homolog](environments/homolog.tfvars.example) e [production](environm
 
 | Variável Terraform | Uso |
 |---|---|
-| `db_url`, `db_user`, `db_password` (sensíveis) | conexão JDBC da Lambda Login |
 | `jwt_private_key` (sensível) | assinatura do token (só Login) |
 | `jwt_public_key` | authorizer; a mesma chave vai para `SERVERLESS_JWT_PUBLIC_KEY` dos serviços |
 | `jwt_issuer` / `jwt_audience` / `jwt_ttl_seconds` | `oficina-auth-serverless` / `oficina-backend` / `900` |
-| `private_subnet_ids`, `lambda_security_group_id` | VPC da Lambda Login (acesso ao RDS) |
-| `backend_base_url`, `orcamento_pagamento_base_url` | Load Balancers do EKS; nulas = só `/auth/cpf` |
-| `notification_api_key` (sensível), `notification_delivery_mode` | chave técnica; `log` ou `ses` |
+| `private_subnet_ids`, `lambda_security_group_id` | VPC da Lambda Login (saída pela NAT) |
+| `backend_base_url`, `orcamento_pagamento_base_url` | Load Balancers do EKS; nulas = só `/auth/cpf`. `backend_base_url` também vira `OS_SERVICE_BASE_URL` da Lambda Login |
+| `notification_api_key` (sensível), `notification_delivery_mode` | chave técnica compartilhada com o OS Service (notificações e `X-Api-Key` da consulta do cliente, `INTERNAL_API_KEY`); `log` ou `ses` |
 | `newrelic_instrumentation_enabled`, `newrelic_license_key`, `newrelic_account_id`, `newrelic_log_forwarding_enabled` | observabilidade |
 
 ## 9. CI/CD
