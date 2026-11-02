@@ -82,7 +82,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/AutenticacaoResponse'
               example:
-                accessToken: eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiIxIiwiY2xpZW50X2lkIjoxLCJyb2xlIjoiQ0xJRU5URSJ9.assinatura
+                accessToken: <jwt-rs256-emitido-pelo-login>
                 tokenType: Bearer
                 expiresIn: 900
         '400':
