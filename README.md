@@ -1,218 +1,196 @@
-> **Tech Challenge Fase 4 — `oficina-auth-serverless`**
->
-> Login por CPF, Lambda Authorizer JWT, notificações e API Gateway.
->
-> Base importada de [`fiap-tech-challenge-fase3-oficina-auth-serverless`](https://github.com/tiagomiele/fiap-tech-challenge-fase3-oficina-auth-serverless) (commit `92c367c`), sem alterações funcionais. A evolução para a Fase 4 é feita por PRs nas próximas fases; o conteúdo abaixo ainda descreve a Fase 3.
+# Oficina Fase 4 — Auth Serverless
 
-# Oficina Fase 3 — Auth Serverless
+Porta de entrada pública da Oficina: **login do cliente por CPF**, **Lambda Authorizer JWT** na frente dos serviços do EKS, **API Gateway** com as rotas do cliente e do webhook do Mercado Pago, e **notificações assíncronas** (SNS → Lambda → SES/log, com DLQ).
 
-Serviço serverless responsável pela autenticação de clientes por CPF, emissão e validação de JWT e entrega assíncrona de notificações da Oficina.
+> Documentação central da Fase 4: [oficina-os-service](https://github.com/tiagomiele/oficina-os-service). Este README cobre só o Auth Serverless.
 
-## Visão de negócio
+## 1. Objetivo de negócio
 
-O Auth permite que um cliente ativo acesse com segurança as funcionalidades relacionadas às suas Ordens de Serviço sem utilizar uma senha criada pela oficina. O CPF identifica o cadastro; um JWT de curta duração representa a sessão autorizada e protege consultas e decisões do cliente.
+- O cliente acompanha a OS, aprova ou rejeita o orçamento e paga **sem senha**: informa o CPF e recebe um token de 15 minutos.
+- Só cliente **ativo** e com **CPF válido** entra; a resposta de recusa é única, então ninguém descobre quais CPFs são clientes.
+- Os serviços no EKS só recebem chamadas de cliente com token válido.
+- O Mercado Pago tem uma URL pública estável (`/webhooks/mercadopago`) para avisar pagamentos.
+- E-mails ao cliente não travam a OS: são enfileirados e reprocessados; falhas definitivas ficam na DLQ.
 
-O mesmo projeto desacopla as notificações da execução da OS. Assim, o atendimento principal não depende do tempo de entrega de e-mail e falhas podem ser repetidas ou encaminhadas para uma fila de erro.
+## 2. Requisitos atendidos
 
-## Responsabilidades
+**Funcionais**
 
-- validar e normalizar o CPF;
-- consultar existência e situação ativa do cliente no PostgreSQL;
-- emitir e validar JWT RSA de curta duração;
-- proteger rotas do cliente com Lambda Authorizer;
-- controlar e rotear requisições pelo API Gateway;
-- receber notificações técnicas, publicá-las no SNS e tratar falhas pela DLQ;
-- entregar por log técnico ou SES opcional, sem expor CPF, token ou mensagem nos logs;
-- publicar logs estruturados, correlação e telemetria New Relic;
-- provisionar os componentes serverless com Terraform.
+| # | Requisito | Onde no código |
+|---|---|---|
+| RF1 | Login por CPF com ou sem máscara, com validação dos dígitos | `domain/Cpf.java`, `handler/CpfAuthenticationHandler.java` |
+| RF2 | Só cliente ativo com documento CPF autentica | `adapter/out/jdbc/JdbcClientRepository.java` |
+| RF3 | Token JWT RS256 com `sub`, `client_id`, `role=CLIENTE`, `iss`, `aud`, `exp`, `jti` | `adapter/out/jwt/JwtTokenAdapter.java` |
+| RF4 | Rotas do cliente protegidas pelo authorizer | `handler/JwtAuthorizerHandler.java`, `apigateway.tf` |
+| RF5 | Rotas do cliente repassadas ao OS Service e ao Orçamento e Pagamento | `apigateway.tf` (`backend_route_keys`, `orcamento_pagamento_route_keys`) |
+| RF6 | Webhook público do Mercado Pago repassado ao Orçamento e Pagamento | `apigateway.tf` (`mercadopago_webhook`) |
+| RF7 | Notificação técnica aceita com chave e entregue de forma assíncrona | `handler/NotificationIngressHandler.java`, `NotificationDeliveryHandler.java`, `notification.tf` |
 
-Regras da Ordem de Serviço permanecem no Backend; EKS e RDS pertencem aos respectivos projetos de infraestrutura.
+**Técnicos**
 
-## Arquitetura do componente
+| Requisito | Como |
+|---|---|
+| Sem enumeração de clientes | 401 `AUTHENTICATION_FAILED` igual para CPF inválido, inexistente ou inativo |
+| Sem PII em logs | CPF, token, destinatário e corpo nunca são logados (`observability/LogSanitizer.java`, `forwarder/AccessLogSanitizer.java`) |
+| Chave privada só no login | o authorizer e os serviços recebem só a chave pública |
+| Comparação segura da chave técnica | `MessageDigest.isEqual` no ingresso de notificações |
+| Correlação | `X-Request-Id` do cliente ou `requestId` do API Gateway, repassado ao EKS e aos logs |
+| Proteção contra abuso | throttling 10 req/s, rajada 20; cache do authorizer 300 s |
+| Cold start dentro do limite | login e authorizer com 1024 MB (limites de 15 s e 10 s do API Gateway) |
+| Clean Architecture | `domain` → `application` (portas) → `adapter/out` e `handler`; validado por ArchUnit (`CleanArchitectureTest`) |
+| AWS Academy | todas as Lambdas usam a `LabRole`; SES opcional (`notification_delivery_mode=log`) |
 
-![Arquitetura resumida do Auth Serverless](docs/assets/arquitetura-auth-resumida.png)
-
-### Fluxo de autenticação
-
-```text
-Cliente
-  → POST /auth/cpf
-  → API Gateway
-  → Lambda de autenticação
-  → consulta ao PostgreSQL
-  → emissão do JWT RSA
-  → cliente utiliza Bearer Token
-  → Lambda Authorizer valida o token
-  → API protegida do Backend
-```
-
-### Fluxo de notificação
-
-```text
-Backend
-  → endpoint interno do API Gateway
-  → Lambda publicadora
-  → SNS
-  → Lambda de entrega
-  → SES ou log técnico
-  → SQS/DLQ em caso de falha definitiva
-```
-
-## Modelo arquitetural
-
-O código utiliza uma Clean Architecture adaptada ao contexto serverless:
-
-- `domain`: regras independentes da AWS, como CPF;
-- `application`: casos de uso e portas de entrada e saída;
-- `adapter/out`: integrações JDBC, JWT, SNS, SES e New Relic;
-- `handler`: adaptadores de entrada das funções Lambda;
-- `config`: composição das dependências;
-- `notification`, `forwarder` e `observability`: processamento assíncrono e telemetria.
-
-Cada função possui responsabilidade delimitada, e serviços externos ficam atrás de interfaces da aplicação.
-
-## Stack e ferramentas
+## 3. Stack técnica
 
 | Área | Tecnologias |
 |---|---|
-| Aplicação | Java 21 e Maven Wrapper |
-| APIs e segurança | API Gateway v2, AWS Lambda, Lambda Authorizer e JWT RSA |
-| Integração | PostgreSQL, Amazon SNS, SQS/DLQ e SES opcional |
-| Infraestrutura | Terraform, HCP Terraform e AWS Academy `LabRole` |
-| Qualidade | JUnit, Spotless, TFLint, Trivy, Gitleaks e actionlint |
-| Entrega | GitHub Actions, GitHub Environments e sincronização de outputs |
-| Observabilidade | Logs JSON, mascaramento de PII, correlação e New Relic serverless |
+| Código | Java 21, Maven Wrapper, AWS Lambda Java Core/Events, Jackson |
+| Segurança | JJWT 0.12 (RS256), Lambda Authorizer REQUEST (payload 2.0, respostas simples) |
+| AWS | API Gateway HTTP API v2, Lambda `java21` arm64, RDS PostgreSQL (JDBC), SNS, SQS (DLQ), SES, CloudWatch Logs |
+| Infraestrutura | Terraform + HCP Terraform (workspaces `homolog` e `production`) |
+| Qualidade | JUnit 5, ArchUnit, Spotless, TFLint, Trivy, Gitleaks, actionlint |
+| Observabilidade | logs JSON, camada New Relic Java (ARM64), log forwarder do API Gateway para o New Relic |
 
-## Estrutura de pastas
+## 4. Arquitetura
 
-```text
-.
-├── .github/workflows/
-│   ├── ci.yml                     # build, testes e segurança
-│   ├── terraform-plan.yml         # plan de homologação e produção
-│   └── terraform-deploy.yml       # apply por ambiente
-├── docs/
-│   ├── arquitetura.md
-│   ├── implantacao-operacao.md
-│   ├── openapi/oficina-auth.yaml
-│   └── assets/                    # diagramas do componente
-├── environments/                  # exemplos de variáveis por ambiente
-├── scripts/                       # validação AWS e sincronização de outputs
-├── src/main/java/br/com/oficina/auth/
-│   ├── domain/                    # regras independentes da infraestrutura
-│   ├── application/               # casos de uso e portas
-│   ├── adapter/out/               # JDBC, JWT, SNS, SES e New Relic
-│   ├── handler/                   # entradas das Lambdas
-│   ├── config/                    # composição das dependências
-│   ├── notification/              # processamento de notificações
-│   ├── forwarder/                 # encaminhamento de logs
-│   └── observability/             # telemetria
-├── src/test/                       # testes Java
-├── tests/                          # testes dos scripts de integração
-├── apigateway.tf                   # HTTP API, rotas e Authorizer
-├── lambda.tf                       # funções de autenticação
-├── notification.tf                # SNS, SQS/DLQ e entrega
-├── newrelic.tf                     # instrumentação serverless
-├── providers.tf
-├── variables.tf
-├── outputs.tf
-└── pom.xml
+![Arquitetura do Auth Serverless](docs/assets/arquitetura-auth-serverless.png)
+
+| Lambda | Handler | Memória / timeout | Função |
+|---|---|---|---|
+| `oficina-auth-<env>-login` | `CpfAuthenticationHandler` | 1024 MB / 15 s (na VPC) | valida o CPF, consulta `clientes` e emite o JWT |
+| `oficina-auth-<env>-authorizer` | `JwtAuthorizerHandler` | 1024 MB / 10 s | valida o token e devolve `isAuthorized` com `subject`, `clientId`, `role`, `requestId` |
+| `oficina-auth-<env>-notification-ingress` | `NotificationIngressHandler` | 512 MB / 18 s | valida a chave e o payload e publica no SNS |
+| `oficina-auth-<env>-notification-delivery` | `NotificationDeliveryHandler` | 384 MB / 30 s | entrega por SES ou só registra (modo `log`) |
+| `oficina-auth-<env>-log-forwarder` (opcional) | `ApiGatewayLogForwarderHandler` | 384 MB / 30 s | envia o log de acesso sanitizado ao New Relic |
+
+### Login e uso do token
+
+![Fluxo de login e token](docs/assets/fluxo-login-jwt.png)
+
+## 5. Rotas do API Gateway
+
+Contrato completo, com schemas, exemplos e erros: [docs/openapi/oficina-auth.yaml](docs/openapi/oficina-auth.yaml). Para visualizar, abra o arquivo em https://editor.swagger.io (File → Import file).
+
+| Rota | Proteção | Destino |
+|---|---|---|
+| `POST /auth/cpf` | pública | Lambda Login |
+| `GET /consulta/ordens-servico/{numeroOs}/status` | JWT | OS Service |
+| `GET /ordens-servico/{numeroOs}/historico` | JWT | OS Service |
+| `GET /orcamentos/{numeroOs}` | JWT | Orçamento e Pagamento |
+| `POST /orcamentos/{numeroOs}/aprovar` | JWT | Orçamento e Pagamento |
+| `POST /orcamentos/{numeroOs}/rejeitar` | JWT | Orçamento e Pagamento |
+| `GET /pagamentos/{numeroOs}` | JWT | Orçamento e Pagamento |
+| `POST /pagamentos/{numeroOs}/nova-tentativa` | JWT | Orçamento e Pagamento |
+| `POST /webhooks/mercadopago` | assinatura `x-signature` (no serviço) | Orçamento e Pagamento |
+| `POST /internal/notifications` | `X-Notification-Key` | Lambda ingresso |
+
+As rotas para o EKS só existem quando `backend_base_url` e `orcamento_pagamento_base_url` estão preenchidas (o `configure-environment.ps1` do OS Service grava as URLs dos Load Balancers no workspace).
+
+**Erros**
+
+| HTTP | Corpo | Quando |
+|---|---|---|
+| 400 | `{"code":"INVALID_REQUEST",...}` | login sem `cpf`/JSON inválido; notificação com payload inválido |
+| 401 | `{"code":"AUTHENTICATION_FAILED",...}` | CPF inválido, inexistente ou inativo |
+| 401 | `{"message":"Unauthorized"}` | rota protegida sem `Authorization` |
+| 403 | `{"message":"Forbidden"}` | token inválido, expirado, de outro emissor/audiência ou sem papel `CLIENTE` |
+| 403/404/409 | Problem Details | resposta do serviço (OS de outro cliente, não encontrada, ação fora de ordem) |
+| 429 | `{"message":"Too Many Requests"}` | acima de 10 req/s |
+| 500 | `{"code":"INTERNAL_ERROR",...}` | falha interna do login (ex. banco fora) |
+| 503 | `{"code":"SERVICE_UNAVAILABLE",...}` | falha ao publicar a notificação no SNS |
+
+### Testar no PowerShell
+
+```powershell
+$api = gh variable get API_GATEWAY_BASE_URL --env production --repo tiagomiele/oficina-os-service
+$login = Invoke-RestMethod -Method Post -Uri "$api/auth/cpf" -ContentType 'application/json' -Body '{"cpf":"<CPF de um cliente ativo>"}'
+$h = @{ Authorization = "Bearer $($login.accessToken)" }
+Invoke-RestMethod -Uri "$api/consulta/ordens-servico/OS-102026-000003/status" -Headers $h
+Invoke-RestMethod -Uri "$api/orcamentos/OS-102026-000003" -Headers $h
 ```
 
-## Pré-requisitos
+Troque `<CPF de um cliente ativo>` pelo CPF cadastrado no OS Service, sem os sinais `< >`. Use `--env homolog` para homologação.
 
-- Java 21;
-- Git;
-- Terraform compatível com `versions.tf`;
-- credenciais AWS válidas somente para plans e deploys remotos;
-- organização e workspaces HCP Terraform configurados para homologação e produção.
+## 6. Banco de dados
 
-O Maven Wrapper está incluído; não é necessário instalar Maven globalmente.
+O Auth não tem banco próprio. A Lambda Login **só lê** a tabela `clientes` do RDS PostgreSQL do OS Service (provisionado pelo [oficina-database-infra](https://github.com/tiagomiele/oficina-database-infra)):
 
-## Validar localmente
-
-Linux/macOS:
-
-```bash
-./mvnw -B clean verify spotless:check
-terraform fmt -check -recursive
-terraform init -backend=false -input=false -lockfile=readonly
-terraform validate
-python3 -m unittest discover -s tests -p 'test_*.py'
+```sql
+SELECT id_cliente FROM clientes
+ WHERE documento_normalizado = ? AND tipo_documento = 'CPF' AND ativo = TRUE;
 ```
 
-Windows PowerShell:
+Para ver os clientes cadastrados, siga a seção de acesso ao banco do OS Service ([README](https://github.com/tiagomiele/oficina-os-service)).
+
+## 7. Executar e validar localmente
+
+Pré-requisitos: Java 21, Terraform e Python 3. Nada é criado na AWS.
 
 ```powershell
 .\mvnw.cmd -B clean verify spotless:check
 terraform fmt -check -recursive
 terraform init -backend=false -input=false -lockfile=readonly
 terraform validate
-python -m unittest discover -s tests -p "test_*.py"
+python -m unittest tests/test_sync_auth_outputs.py
 ```
 
-A validação local não cria recursos na AWS.
+O JAR das Lambdas fica em `target/oficina-auth.jar`.
 
-## Contrato da API
+## 8. Configuração
 
-- autenticação: `POST /auth/cpf`;
-- notificação técnica: `POST /internal/notifications`;
-- a URL base é gerada pelo Terraform no output `api_base_url`.
+Exemplos: [homolog](environments/homolog.tfvars.example) e [production](environments/production.tfvars.example). Os valores sensíveis ficam no HCP Terraform e são gravados pelo `configure-environment.ps1` do OS Service.
 
-A URL do API Gateway muda quando o ambiente AWS Academy é reconstruído. Não grave URLs temporárias como configuração permanente.
-
-## Configuração e segurança
-
-Os arquivos de exemplo estão em:
-
-- [Homologação](environments/homolog.tfvars.example)
-- [Produção](environments/production.tfvars.example)
-
-Chaves RSA, credenciais do banco, API keys e chaves New Relic devem ser armazenadas como variáveis sensíveis no HCP Terraform ou como Secrets dos GitHub Environments. Nenhum segredo real deve ser versionado.
-
-Os logs não devem registrar CPF completo, JWT, corpo de notificação ou credenciais.
-
-## CI/CD e implantação
-
-| Etapa | Comportamento |
+| Variável Terraform | Uso |
 |---|---|
-| Pull Request | executa CI e Terraform Plan, sem criar recursos |
-| Merge em `homolog` | empacota as Lambdas e implanta homologação |
-| Promoção para `main` | implanta produção pelo ambiente protegido |
-| Pós-deploy | sincroniza URLs e configurações necessárias com o Backend |
+| `db_url`, `db_user`, `db_password` (sensíveis) | conexão JDBC da Lambda Login |
+| `jwt_private_key` (sensível) | assinatura do token (só Login) |
+| `jwt_public_key` | authorizer; a mesma chave vai para `SERVERLESS_JWT_PUBLIC_KEY` dos serviços |
+| `jwt_issuer` / `jwt_audience` / `jwt_ttl_seconds` | `oficina-auth-serverless` / `oficina-backend` / `900` |
+| `private_subnet_ids`, `lambda_security_group_id` | VPC da Lambda Login (acesso ao RDS) |
+| `backend_base_url`, `orcamento_pagamento_base_url` | Load Balancers do EKS; nulas = só `/auth/cpf` |
+| `notification_api_key` (sensível), `notification_delivery_mode` | chave técnica; `log` ou `ses` |
+| `newrelic_instrumentation_enabled`, `newrelic_license_key`, `newrelic_account_id`, `newrelic_log_forwarding_enabled` | observabilidade |
 
-Fluxo de promoção:
+## 9. CI/CD
 
-```text
-feature → Pull Request → homolog → Pull Request → main
+![Pipeline de implantação](docs/assets/pipeline-implantacao-auth.png)
+
+| Workflow | Quando | O que faz |
+|---|---|---|
+| `ci.yml` | PR e push | actionlint, teste do sync, `mvnw verify spotless:check` (JUnit + ArchUnit), `terraform fmt/validate`, TFLint, Trivy, Gitleaks |
+| `terraform-plan.yml` | PR para `homolog`/`main` | empacota e roda `terraform plan` no workspace do ambiente |
+| `terraform-deploy.yml` | push em `homolog` (homologação) ou `main` (produção) | valida a sessão AWS Academy, empacota, `terraform apply` e roda `scripts/sync-auth-outputs.py` |
+
+O sync grava `API_GATEWAY_BASE_URL`, `AUTH_BASE_URL` e `NOTIFICATION_ENDPOINT` no GitHub Environment do `oficina-os-service`. O deploy exige `TF_APPLY_ENABLED=true` no Environment.
+
+**Outputs:** `api_base_url`, `cpf_authentication_url`, `mercadopago_webhook_url` (cole no painel do Mercado Pago), `notification_endpoint`, `notification_topic_arn`, `notification_dlq_url`, `login_lambda_name`, `authorizer_lambda_name`, `api_access_log_group`, `newrelic_instrumentation`.
+
+## 10. Observabilidade
+
+- **Logs JSON** em CloudWatch (`/aws/lambda/oficina-auth-<env>-*`, retenção 7 dias), com `function`, `outcome` (`SUCCESS`, `DENIED`, `ALLOW`, `DENY`, `ACCEPTED`...), `requestId`, duração e código de erro. Sem CPF, token ou e-mail.
+- **Log de acesso** do API Gateway em `/aws/apigateway/oficina-auth-<env>`: rota, status, latência, erro de integração e do authorizer.
+- **New Relic:** com `newrelic_instrumentation_enabled=true`, a camada `NewRelicAgentJavaARM64-slim` instrumenta as Lambdas (APM serverless, distributed tracing, atributos `auth.outcome` e `authorization.outcome`). Com `newrelic_log_forwarding_enabled=true`, o log de acesso vai para o New Relic com `logtype=api-gateway-access`.
+- Dashboard e alertas: [oficina-kubernetes-infra](https://github.com/tiagomiele/oficina-kubernetes-infra).
+
+```powershell
+aws logs tail /aws/lambda/oficina-auth-production-login --since 15m --region us-west-2
+aws logs tail /aws/lambda/oficina-auth-production-authorizer --since 15m --region us-west-2
+aws logs tail /aws/apigateway/oficina-auth-production --since 15m --region us-west-2
+aws sqs get-queue-attributes --queue-url (aws sqs get-queue-url --queue-name oficina-auth-production-notification-dlq --region us-west-2 --query QueueUrl --output text) --attribute-names ApproximateNumberOfMessages --region us-west-2
 ```
 
-A implantação cria API Gateway, Lambdas, Authorizer, logs, SNS, SQS/DLQ, integração SES opcional e instrumentação New Relic.
+## 11. Repositórios da Fase 4
 
-## Outputs principais
-
-| Output | Finalidade |
+| Repositório | Papel |
 |---|---|
-| `api_base_url` | URL base do API Gateway |
-| `cpf_authentication_url` | endpoint de autenticação por CPF |
-| `notification_endpoint` | endpoint interno consumido pelo Backend |
-| `login_lambda_name` | nome da Lambda de autenticação |
-| `authorizer_lambda_name` | nome da Lambda Authorizer |
-| `notification_topic_arn` | ARN do tópico SNS |
-| `notification_dlq_url` | URL da fila de falhas |
+| [oficina-os-service](https://github.com/tiagomiele/oficina-os-service) | OS, orquestração da Saga e documentação central |
+| [oficina-orcamento-pagamento-service](https://github.com/tiagomiele/oficina-orcamento-pagamento-service) | orçamento, pagamento e Mercado Pago |
+| [oficina-diagnostico-reparo-service](https://github.com/tiagomiele/oficina-diagnostico-reparo-service) | fila do técnico, diagnóstico e reparo |
+| [oficina-database-infra](https://github.com/tiagomiele/oficina-database-infra) | RDS, DynamoDB, SQS e DLQs |
+| [oficina-kubernetes-infra](https://github.com/tiagomiele/oficina-kubernetes-infra) | EKS e New Relic |
 
-## Documentação e evidências
-
-- [Documentação central da Fase 3](https://github.com/tiagomiele/fiap-tech-challenge-fase3-oficina-backend/tree/feature/validacao-deploy-aplicacao)
-- [Requisitos obrigatórios e evidências](https://github.com/tiagomiele/fiap-tech-challenge-fase3-oficina-backend/blob/feature/validacao-deploy-aplicacao/README-requisitos-obrigatorios-fase-3.md)
-- [Collection Postman integrada](https://github.com/tiagomiele/fiap-tech-challenge-fase3-oficina-backend/blob/feature/validacao-deploy-aplicacao/tests/postman/oficina-weeks4-5.postman_collection.json)
-
-## Projetos relacionados
-
-- [Backend](https://github.com/tiagomiele/fiap-tech-challenge-fase3-oficina-backend)
-- [Database Infra](https://github.com/tiagomiele/fiap-tech-challenge-fase3-oficina-database-infra)
-- [Kubernetes Infra](https://github.com/tiagomiele/fiap-tech-challenge-fase3-oficina-kubernetes-infra)
+Base histórica: [Fase 3 — Auth Serverless](https://github.com/tiagomiele/fiap-tech-challenge-fase3-oficina-auth-serverless).
 
 ## Licença
 
-Consulte o arquivo [LICENSE](LICENSE).
+[LICENSE](LICENSE)
