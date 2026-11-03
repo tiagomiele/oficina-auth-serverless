@@ -36,24 +36,6 @@ variable "private_subnet_ids" {
   }
 }
 
-variable "db_url" {
-  description = "URL JDBC PostgreSQL com sslmode=require."
-  type        = string
-  sensitive   = true
-}
-
-variable "db_user" {
-  description = "Usuário PostgreSQL de leitura para autenticação."
-  type        = string
-  sensitive   = true
-}
-
-variable "db_password" {
-  description = "Senha PostgreSQL do usuário de autenticação."
-  type        = string
-  sensitive   = true
-}
-
 variable "jwt_private_key" {
   description = "Chave privada RSA PKCS#8 em PEM usada apenas pela Lambda de login."
   type        = string
@@ -221,7 +203,7 @@ variable "orcamento_pagamento_base_url" {
 }
 
 variable "notification_api_key" {
-  description = "Chave compartilhada pelo backend e pela Lambda de ingresso de notificações."
+  description = "Chave técnica compartilhada com o OS Service: ingresso de notificações e consulta interna do cliente no login."
   type        = string
   sensitive   = true
 

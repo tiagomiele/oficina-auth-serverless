@@ -24,7 +24,6 @@ public final class TestKeys {
     return new AuthConfig(
         null,
         null,
-        null,
         encoded(pair.getPrivate()),
         encoded(pair.getPublic()),
         issuer,
